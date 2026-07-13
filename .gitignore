@@ -1,0 +1,21 @@
+# Build output
+build/
+build_release/
+build-Debug/
+build-Release/
+
+# Compiled binary
+im_chat_server.exe
+stress_test.exe
+
+# IDE / editor
+.vscode/
+.idea/
+*.user
+.cache/
+
+# Logs
+logs/
+
+# Database (optional — keep if you want to ship a sample DB)
+# imchat.db
