@@ -25,13 +25,28 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(Sodium REQUIRED)
 
+# Some fmt packages ship both libfmt.a and a DLL import library, and the
+# imported target points at the DLL. Swap it for the archive so the executable
+# does not depend on libfmt-*.dll at runtime.
+find_file(IMCHAT_FMT_STATIC NAMES libfmt.a HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
+if(IMCHAT_FMT_STATIC AND TARGET fmt::fmt)
+    add_library(imchat_fmt_static STATIC IMPORTED GLOBAL)
+    set_target_properties(imchat_fmt_static PROPERTIES
+        IMPORTED_LOCATION "${IMCHAT_FMT_STATIC}")
+    set_target_properties(spdlog::spdlog_header_only PROPERTIES
+        INTERFACE_LINK_LIBRARIES "Threads::Threads;imchat_fmt_static")
+    message(STATUS "Using static fmt: ${IMCHAT_FMT_STATIC}")
+endif()
+
 # ── Main server ──────────────────────────────────────────
 add_executable(im_chat_server
     src/chat_room.cpp
     src/config.cpp
+    src/http_server.cpp
     src/main.cpp
     src/server.cpp
     src/session_manager.cpp
+    src/thread_pool.cpp
     src/websocket_session.cpp
     src/database.cpp
 )

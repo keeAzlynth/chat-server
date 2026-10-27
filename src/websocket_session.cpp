@@ -2,12 +2,12 @@
 #include "imchat/session_manager.hpp"
 
 #include <boost/asio/dispatch.hpp>
-#include <boost/asio/strand.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <utility>
 
 namespace imchat {
 namespace {
@@ -16,48 +16,49 @@ std::atomic_uint64_t next_connection_number{1};
 
 std::string make_connection_id()
 {
-    return "conn_" + std::to_string(next_connection_number.fetch_add(1));
+    return "conn_" + std::to_string(next_connection_number.fetch_add(1, std::memory_order_relaxed));
 }
+
+// A client that stops reading must not be able to grow our heap without bound.
+constexpr std::size_t kMaxQueuedBytes = 8 * 1024 * 1024;
 
 } // namespace
 
-WebSocketSession::WebSocketSession(boost::asio::ip::tcp::socket socket, SessionManager& session_manager)
+WebSocketSession::WebSocketSession(boost::asio::ip::tcp::socket socket,
+                                   SessionManager& session_manager,
+                                   const AppConfig& config)
     : websocket_(std::move(socket))
     , session_manager_(session_manager)
     , connection_id_(make_connection_id())
+    , max_message_bytes_(config.max_ws_message_bytes)
+    , max_queued_bytes_(kMaxQueuedBytes)
 {
+    // Nagle delays small frames by up to 40 ms — fatal for a chat UI.
+    boost::beast::error_code ec;
+    websocket_.next_layer().set_option(boost::asio::ip::tcp::no_delay(true), ec);
 }
 
 void WebSocketSession::run()
 {
-    // Custom timeout: 30s handshake, 120s idle (detect zombie connections),
-    // with automatic keep-alive pings every 30s
     boost::beast::websocket::stream_base::timeout timeout_opt;
     timeout_opt.handshake_timeout = std::chrono::seconds(30);
-    timeout_opt.idle_timeout = std::chrono::seconds(120);
-    timeout_opt.keep_alive_pings = true;
+    timeout_opt.idle_timeout      = std::chrono::seconds(120);
+    timeout_opt.keep_alive_pings  = true;
     websocket_.set_option(timeout_opt);
 
-    // Application-level ping/pong (detect half-open connections faster than TCP keepalive)
+    // Cap a single frame. Beast would otherwise accept 16 MB by default.
+    websocket_.read_message_max(max_message_bytes_);
+
     websocket_.set_option(boost::beast::websocket::stream_base::decorator(
         [](boost::beast::websocket::response_type& response) {
-            response.set(boost::beast::http::field::server, "im-chat-beast");
+            response.set(boost::beast::http::field::server, "im-chat/3.0");
         }));
 
-    // Auto-pong: Beast responds to ping frames automatically
-    websocket_.control_callback(
-        [this](boost::beast::websocket::frame_type kind, boost::beast::string_view) {
-            if (kind == boost::beast::websocket::frame_type::pong) {
-                last_pong_ = std::chrono::steady_clock::now();
-            }
-        });
-
-    auto self = shared_from_this();
     websocket_.async_accept(
-        boost::beast::bind_front_handler([self](boost::beast::error_code ec) {
+        boost::beast::bind_front_handler([self = shared_from_this()](boost::beast::error_code ec) {
             if (ec) {
-                spdlog::warn("websocket accept failed: {}", ec.message());
-                self->shutdown();
+                spdlog::debug("websocket accept failed: {}", ec.message());
+                self->close();
                 return;
             }
             self->do_read();
@@ -70,13 +71,22 @@ void WebSocketSession::send(std::string text)
 
     boost::asio::dispatch(
         websocket_.get_executor(),
-        boost::beast::bind_front_handler(
-            [self = shared_from_this(), text = std::move(text)]() mutable {
-                if (self->is_closed()) return;
-                const bool idle = self->outgoing_.empty();
-                self->outgoing_.push_back(std::move(text));
-                if (idle) self->do_write();
-            }));
+        [self = shared_from_this(), text = std::move(text)]() mutable {
+            if (self->is_closed()) return;
+
+            const bool idle = self->outgoing_.empty();
+            self->queued_bytes_ += text.size();
+            self->outgoing_.push_back(std::move(text));
+
+            if (self->queued_bytes_ > self->max_queued_bytes_) {
+                spdlog::warn("closing slow consumer {} ({} bytes queued)",
+                             self->connection_id_, self->queued_bytes_);
+                self->close();
+                return;
+            }
+
+            if (idle) self->do_write();
+        });
 }
 
 void WebSocketSession::do_read()
@@ -94,16 +104,19 @@ void WebSocketSession::on_read(boost::beast::error_code ec, std::size_t)
 
     if (ec) {
         if (ec != boost::beast::websocket::error::closed) {
-            spdlog::warn("read failed on {}: {}", connection_id_, ec.message());
+            spdlog::debug("read failed on {}: {}", connection_id_, ec.message());
         }
-        shutdown();
+        close();
         return;
     }
 
-    // Zero-copy: use buffer data directly instead of buffers_to_string
-    auto text = std::string(
-        static_cast<const char*>(buffer_.data().data()),
-        buffer_.data().size());
+    if (buffer_.size() > max_message_bytes_) {
+        spdlog::warn("{} sent an oversized frame ({} bytes)", connection_id_, buffer_.size());
+        close();
+        return;
+    }
+
+    std::string text(static_cast<const char*>(buffer_.data().data()), buffer_.size());
     buffer_.consume(buffer_.size());
 
     session_manager_.handle_message(shared_from_this(), text);
@@ -117,28 +130,36 @@ void WebSocketSession::do_write()
     websocket_.text(true);
     websocket_.async_write(
         boost::asio::buffer(outgoing_.front()),
-        boost::beast::bind_front_handler([self = shared_from_this()](boost::beast::error_code ec, std::size_t) {
+        [self = shared_from_this()](boost::beast::error_code ec, std::size_t) {
             if (ec) {
-                spdlog::warn("write failed on {}: {}", self->connection_id_, ec.message());
-                self->shutdown();
+                self->close();
                 return;
             }
+
+            self->queued_bytes_ -= self->outgoing_.front().size();
             self->outgoing_.pop_front();
-            if (!self->outgoing_.empty()) {
-                self->do_write();
-            }
-        }));
+
+            if (!self->outgoing_.empty()) self->do_write();
+        });
 }
 
-void WebSocketSession::shutdown()
+void WebSocketSession::close()
 {
-    if (closed_.exchange(true)) return;
+    if (closed_.exchange(true, std::memory_order_acq_rel)) return;
+    boost::asio::dispatch(websocket_.get_executor(), [self = shared_from_this()]() {
+        self->do_close();
+    });
+}
 
+void WebSocketSession::do_close()
+{
     boost::beast::error_code ec;
     if (websocket_.next_layer().is_open()) {
         websocket_.next_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
         websocket_.next_layer().close(ec);
     }
+    outgoing_.clear();
+    queued_bytes_ = 0;
     session_manager_.remove(connection_id_);
 }
 

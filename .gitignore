@@ -1,5 +1,6 @@
 # Build output
 build/
+build-verify/
 build_release/
 build-Debug/
 build-Release/
@@ -17,5 +18,18 @@ stress_test.exe
 # Logs
 logs/
 
-# Database (optional — keep if you want to ship a sample DB)
-# imchat.db
+# Uploaded files (runtime data)
+uploads/
+
+# Local database (contains chat history — never commit)
+imchat.db
+imchat.db-shm
+imchat.db-wal
+
+# Local tooling / agent workspace
+.workbuddy/
+tools/ngrok.exe
+
+# OS
+Thumbs.db
+.DS_Store

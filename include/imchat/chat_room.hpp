@@ -1,6 +1,8 @@
 #pragma once
 
+#include "imchat/config.hpp"
 #include "imchat/database.hpp"
+#include "imchat/rate_limiter.hpp"
 #include "imchat/string_hash.hpp"
 
 #include <nlohmann/json.hpp>
@@ -8,7 +10,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -58,14 +59,14 @@ struct UserPermissions {
         UserPermissions perms;
         switch (level) {
         case UserLevel::Guest:
-            perms.can_send_private  = false;
-            perms.can_create_group  = false;
+            perms.can_send_private   = false;
+            perms.can_create_group   = false;
             perms.max_message_length = 200;
             perms.max_groups         = 0;
             break;
         case UserLevel::Member:
             perms.can_create_group = true;
-            perms.max_groups = 3;
+            perms.max_groups       = 3;
             break;
         case UserLevel::VIP:
             perms.max_message_length = 1000;
@@ -96,10 +97,36 @@ struct UserPermissions {
     }
 };
 
+// Routing info for one command result.
+//
+// The previous design used a single `broadcast` flag plus an optional
+// `target_user_id`, which forced group messages to be sprayed to every
+// connected client. Now every event states exactly who must receive it:
+//
+//   ack         – send the payload back to the requesting connection
+//   broadcast   – send it to every connected client
+//   recipients  – send it to these user ids (all of their devices)
 struct RoomEvent {
-    nlohmann::json payload;
-    std::string    target_user_id;
-    bool           broadcast{false};
+    nlohmann::json           payload;
+    std::vector<std::string> recipients;
+    bool                     broadcast{false};
+    bool                     ack{true};
+
+    RoomEvent() = default;
+    explicit RoomEvent(nlohmann::json p) : payload(std::move(p)) {}
+    RoomEvent(nlohmann::json p, std::vector<std::string> rcpt)
+        : payload(std::move(p)), recipients(std::move(rcpt)) {}
+
+    [[nodiscard]] static RoomEvent everyone(nlohmann::json p) {
+        RoomEvent e{std::move(p)};
+        e.broadcast = true;
+        return e;
+    }
+    [[nodiscard]] static RoomEvent silent_to(nlohmann::json p, std::vector<std::string> rcpt) {
+        RoomEvent e{std::move(p), std::move(rcpt)};
+        e.ack = false;
+        return e;
+    }
 };
 
 struct JoinResult {
@@ -110,146 +137,176 @@ struct JoinResult {
 
 class ChatRoom final {
 public:
-    explicit ChatRoom(std::size_t message_max_length, std::shared_ptr<Database> db);
+    ChatRoom(const AppConfig& config, std::shared_ptr<Database> db);
 
-    // Auth
+    // ── Auth ─────────────────────────────────────────────
     [[nodiscard]] RoomEvent register_user(std::string_view connection_id, std::string_view username,
-                           std::string_view password, std::string_view nickname,
-                           std::string_view device_name = "");
+                                          std::string_view password, std::string_view nickname,
+                                          std::string_view device_name = "");
     [[nodiscard]] RoomEvent login(std::string_view connection_id, std::string_view username,
-                   std::string_view password, std::string_view device_name = "");
+                                  std::string_view password, std::string_view device_name = "");
     [[nodiscard]] RoomEvent resume_session(std::string_view connection_id, std::string_view token);
     [[nodiscard]] RoomEvent get_user_devices(std::string_view connection_id);
     [[nodiscard]] RoomEvent logout(std::string_view connection_id);
 
-    // Room
+    // ── Room ─────────────────────────────────────────────
     [[nodiscard]] JoinResult join(std::string_view connection_id, std::string_view nickname);
     [[nodiscard]] std::optional<RoomEvent> leave(std::string_view connection_id);
     [[nodiscard]] RoomEvent send_message(std::string_view connection_id, std::string_view text);
     [[nodiscard]] RoomEvent send_file_message(std::string_view connection_id, std::string_view text,
-                                std::string_view file_url, std::string_view file_name, std::int64_t file_size);
-    [[nodiscard]] RoomEvent send_private_message(std::string_view connection_id, std::string_view receiver_id, std::string_view text);
+                                              std::string_view file_url, std::string_view file_name,
+                                              std::int64_t file_size);
+    [[nodiscard]] RoomEvent send_private_message(std::string_view connection_id,
+                                                 std::string_view receiver_id, std::string_view text);
     [[nodiscard]] RoomEvent typing(std::string_view connection_id) const;
     [[nodiscard]] RoomEvent recall_message(std::string_view connection_id, std::int64_t message_id);
     [[nodiscard]] RoomEvent mark_read(std::string_view connection_id, std::int64_t message_id);
-    [[nodiscard]] RoomEvent edit_message(std::string_view connection_id, std::int64_t message_id, std::string_view new_text);
+    [[nodiscard]] RoomEvent edit_message(std::string_view connection_id, std::int64_t message_id,
+                                         std::string_view new_text);
     [[nodiscard]] RoomEvent delete_message(std::string_view connection_id, std::int64_t message_id);
 
-    // Pin & Save
-    [[nodiscard]] RoomEvent pin_message(std::string_view connection_id, std::int64_t message_id, std::string_view chat_id);
-    [[nodiscard]] RoomEvent unpin_message(std::string_view connection_id, std::int64_t message_id, std::string_view chat_id);
+    // ── Pin & save ───────────────────────────────────────
+    [[nodiscard]] RoomEvent pin_message(std::string_view connection_id, std::int64_t message_id,
+                                        std::string_view chat_id);
+    [[nodiscard]] RoomEvent unpin_message(std::string_view connection_id, std::int64_t message_id,
+                                          std::string_view chat_id);
     [[nodiscard]] RoomEvent get_pinned_messages(std::string_view connection_id, std::string_view chat_id);
-    [[nodiscard]] RoomEvent save_message_to_collection(std::string_view connection_id, std::int64_t message_id, std::string_view chat_id);
-    [[nodiscard]] RoomEvent unsave_message_from_collection(std::string_view connection_id, std::int64_t message_id);
+    [[nodiscard]] RoomEvent save_message_to_collection(std::string_view connection_id,
+                                                       std::int64_t message_id, std::string_view chat_id);
+    [[nodiscard]] RoomEvent unsave_message_from_collection(std::string_view connection_id,
+                                                           std::int64_t message_id);
     [[nodiscard]] RoomEvent get_saved_messages(std::string_view connection_id);
 
-    // Group
+    // ── Group ────────────────────────────────────────────
     [[nodiscard]] RoomEvent create_group(std::string_view connection_id, std::string_view group_name);
     [[nodiscard]] RoomEvent join_group(std::string_view connection_id, std::string_view group_id);
     [[nodiscard]] RoomEvent leave_group(std::string_view connection_id, std::string_view group_id);
-    [[nodiscard]] RoomEvent send_group_message(std::string_view connection_id, std::string_view group_id, std::string_view text);
+    [[nodiscard]] RoomEvent send_group_message(std::string_view connection_id, std::string_view group_id,
+                                               std::string_view text);
     [[nodiscard]] RoomEvent get_group_members(std::string_view connection_id, std::string_view group_id);
-    [[nodiscard]] RoomEvent get_group_message_history(std::string_view connection_id, std::string_view group_id, int limit = 50);
-    [[nodiscard]] RoomEvent kick_user(std::string_view connection_id, std::string_view target_user_id, std::string_view group_id);
-    [[nodiscard]] RoomEvent ban_user(std::string_view connection_id, std::string_view target_user_id, std::string_view group_id);
+    [[nodiscard]] RoomEvent get_group_message_history(std::string_view connection_id,
+                                                      std::string_view group_id, int limit = 50);
+    [[nodiscard]] RoomEvent list_groups(std::string_view connection_id);
+    [[nodiscard]] RoomEvent kick_user(std::string_view connection_id, std::string_view target_user_id,
+                                      std::string_view group_id);
+    [[nodiscard]] RoomEvent ban_user(std::string_view connection_id, std::string_view target_user_id,
+                                     std::string_view group_id);
 
-    // Query
+    // ── Query ────────────────────────────────────────────
     [[nodiscard]] RoomEvent get_online_users(std::string_view connection_id) const;
-    [[nodiscard]] RoomEvent get_user_info(std::string_view connection_id, std::string_view target_user_id) const;
-    [[nodiscard]] RoomEvent get_message_history(std::string_view connection_id, int limit = 50, std::int64_t before_ts = 0);
-    [[nodiscard]] RoomEvent get_private_message_history(std::string_view connection_id, std::string_view other_user_id, int limit = 50);
+    [[nodiscard]] RoomEvent get_user_info(std::string_view connection_id,
+                                          std::string_view target_user_id) const;
+    [[nodiscard]] RoomEvent get_message_history(std::string_view connection_id, int limit = 50,
+                                                std::int64_t before_ts = 0);
+    [[nodiscard]] RoomEvent get_private_message_history(std::string_view connection_id,
+                                                        std::string_view other_user_id, int limit = 50);
 
-    // Search & Schedule (v2.3)
-    [[nodiscard]] RoomEvent search_messages(std::string_view connection_id, std::string_view query, int limit = 50);
+    // ── Search & schedule ────────────────────────────────
+    [[nodiscard]] RoomEvent search_messages(std::string_view connection_id, std::string_view query,
+                                            int limit = 50);
     [[nodiscard]] RoomEvent schedule_message(std::string_view connection_id, std::string_view text,
-                                              std::string_view chat_type, std::string_view chat_id, std::int64_t send_at);
+                                             std::string_view chat_type, std::string_view chat_id,
+                                             std::int64_t send_at);
 
+    // ── Session helpers ──────────────────────────────────
+    [[nodiscard]] std::vector<std::string> connections_for_user(std::string_view user_id) const;
     [[nodiscard]] std::string connection_id_for_user(std::string_view user_id) const;
-    [[nodiscard]] nlohmann::json error(ErrorCode code) const noexcept;
+    void forget_connection(std::string_view connection_id);
+
+    [[nodiscard]] nlohmann::json error(ErrorCode code) const;
+
+    struct Stats {
+        std::size_t users;
+        std::size_t online_users;
+        std::size_t connections;
+        std::size_t groups;
+    };
+    [[nodiscard]] Stats stats() const;
 
 private:
-    // Hot User struct - frequently accessed fields grouped
+    // A user may be reachable through several connections at once
+    // (phone + browser). `connections` is the source of truth for presence.
     struct User {
-        std::int64_t last_active{0};
-        std::string user_id;
-        std::string username;
-        std::string nickname;
-        std::string connection_id;
-        UserLevel   level{UserLevel::Member};
-        std::atomic<bool> logged_in{false};
-        std::atomic<bool> online{false};
-    };
+        std::string      user_id;
+        std::string      username;
+        std::string      nickname;
+        StringSet        connections;
+        UserLevel        level{UserLevel::Member};
+        bool             guest{false};
+        std::int64_t     last_active{0};
 
-    struct Group {
-        std::int64_t created_at{0};
-        StringSet   members;
-        StringSet   admins;
-        StringSet   banned_users;
-        std::string group_id;
-        std::string name;
-        std::string owner_id;
+        [[nodiscard]] std::string primary_connection() const {
+            return connections.empty() ? std::string{} : *connections.begin();
+        }
+        [[nodiscard]] bool online() const noexcept { return !connections.empty(); }
     };
 
     using UserPtr = std::shared_ptr<User>;
 
-    // --- Validation helpers ---
-    [[nodiscard]] UserPtr find_user_by_connection(std::string_view connection_id) const;
-    [[nodiscard]] bool validate_connection(std::string_view connection_id, UserPtr& out_user) const;
-
-    struct ValidatedUser {
-        UserPtr user;
-        UserPermissions perms;
+    struct Group {
+        StringSet    members;
+        StringSet    admins;
+        StringSet    banned_users;
+        std::string  group_id;
+        std::string  name;
+        std::string  owner_id;
+        std::int64_t created_at{0};
     };
 
-    [[nodiscard]] std::variant<ValidatedUser, RoomEvent> require_user(std::string_view connection_id) const;
-    [[nodiscard]] std::variant<ValidatedUser, RoomEvent> require_user_with_perm(std::string_view connection_id, bool UserPermissions::*perm) const;
-
-    struct GroupRef {
-        StringMap<Group>::iterator it;
+    struct UserSnapshot {
+        std::string user_id;
+        std::string username;
+        std::string nickname;
+        UserLevel   level{UserLevel::Member};
+        bool        guest{false};
     };
-    [[nodiscard]] std::variant<GroupRef, RoomEvent> require_group(std::string_view group_id);
 
-    [[nodiscard]] std::variant<std::string, RoomEvent> validate_text(std::string_view text, int max_length) const;
+    // ── Validation ───────────────────────────────────────
+    [[nodiscard]] std::optional<UserSnapshot> snapshot_by_connection(std::string_view connection_id) const;
+    [[nodiscard]] std::optional<UserSnapshot> snapshot_by_id(std::string_view user_id) const;
+    [[nodiscard]] std::variant<UserSnapshot, RoomEvent> require_user(std::string_view connection_id) const;
+    [[nodiscard]] std::variant<UserSnapshot, RoomEvent> require_perm(std::string_view connection_id,
+                                                                    bool UserPermissions::*perm) const;
+    [[nodiscard]] std::variant<std::string, RoomEvent> validate_text(std::string_view text,
+                                                                   int max_length) const;
 
-    void register_in_maps(UserPtr user, std::string_view connection_id, std::string_view username);
-    void remove_from_maps(const UserPtr& user, std::string_view connection_id);
+    // ── Membership bookkeeping (all take the state lock) ──
+    void attach_connection(const UserPtr& user, std::string_view connection_id);
+    void detach_connection(std::string_view connection_id);
+    void load_groups();
 
-    [[nodiscard]] static nlohmann::json message_to_json(const MessageRecord& msg) noexcept;
-    [[nodiscard]] std::optional<MessageRecord> find_message_by_id(std::int64_t message_id) const;
+    // Copies out what a caller needs so the lock can be released before any
+    // database work happens.
+    [[nodiscard]] std::optional<Group> group_snapshot(std::string_view group_id) const;
+    [[nodiscard]] std::vector<std::string> group_recipients(std::string_view group_id,
+                                                            std::string_view except_user) const;
 
-    [[nodiscard]] std::string generate_id(std::string_view prefix);
+    // ── Helpers ──────────────────────────────────────────
+    [[nodiscard]] static nlohmann::json message_to_json(const MessageRecord& msg);
+    [[nodiscard]] nlohmann::json message_json(const MessageRecord& msg, std::int64_t message_id) const;
     [[nodiscard]] static std::string trim(std::string_view value);
     [[nodiscard]] static const char* code_name(ErrorCode code) noexcept;
     [[nodiscard]] static const char* code_message(ErrorCode code) noexcept;
-    [[nodiscard]] UserPermissions get_permissions(std::string_view user_id) const;
+    [[nodiscard]] static int clamp_limit(int limit, std::size_t max_limit) noexcept;
+    [[nodiscard]] UserPermissions permissions(UserLevel level) const;
 
-    // Rate limiting: simple token bucket per connection
-    struct RateLimitState {
-        int tokens{10};          // Max messages per window
-        std::int64_t window_start{0};
-    };
-    mutable StringMap<RateLimitState> rate_limits_;
-    bool check_rate_limit(std::string_view connection_id) const;
+    [[nodiscard]] RoomEvent rate_limited() const;
+    bool allow_command(std::string_view connection_id) const;
 
-    // In-memory message ring buffer (avoids DB hits for recent history)
-    static constexpr std::size_t MAX_RECENT_MSGS = 200;
-    std::deque<MessageRecord> recent_messages_;
-    std::deque<MessageRecord> recent_private_msgs_;
-    StringMap<std::deque<MessageRecord>> group_message_caches_;
-    static constexpr std::size_t MAX_GROUP_MSGS = 100;
-
-    // --- Data members (hot fields first) ---
     std::shared_ptr<Database> db_;
-    mutable std::shared_mutex mutex_;
+    std::size_t               message_max_length_;
+    std::size_t               max_history_limit_;
 
-    // Maps - frequently accessed together
-    StringMap<UserPtr> users_by_id_;
-    StringMap<UserPtr> users_by_connection_;
-    StringMap<UserPtr> users_by_username_;
-    StringSet          online_nicknames_;
+    mutable std::shared_mutex mutex_;          // guards the maps below
+    StringMap<UserPtr>        users_by_id_;
+    StringMap<UserPtr>        users_by_username_;
+    StringMap<std::string>    user_id_by_connection_;
+    StringSet                 online_nicknames_;   // guests only
 
-    StringMap<Group> groups_;
-    std::size_t message_max_length_;
+    StringMap<Group>          groups_;
+
+    mutable RateLimiter       command_limiter_;
+    mutable RateLimiter       auth_limiter_;
 };
 
 } // namespace imchat

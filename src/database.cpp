@@ -72,12 +72,61 @@ std::int64_t SqliteStmt::column_int64(int idx) const noexcept
 }
 
 // ============================================================
+// Stmt — non-owning view over a cached statement
+// ============================================================
+
+Stmt::~Stmt()
+{
+    if (stmt_) {
+        sqlite3_reset(stmt_);
+        sqlite3_clear_bindings(stmt_);
+    }
+}
+
+bool Stmt::bind_text(int idx, const std::string& value) noexcept
+{
+    return sqlite3_bind_text(stmt_, idx, value.c_str(), static_cast<int>(value.size()),
+                             SQLITE_TRANSIENT) == SQLITE_OK;
+}
+
+bool Stmt::bind_int64(int idx, std::int64_t value) noexcept
+{
+    return sqlite3_bind_int64(stmt_, idx, value) == SQLITE_OK;
+}
+
+bool Stmt::bind_int(int idx, int value) noexcept
+{
+    return sqlite3_bind_int(stmt_, idx, value) == SQLITE_OK;
+}
+
+int Stmt::step() noexcept
+{
+    return sqlite3_step(stmt_);
+}
+
+std::string Stmt::column_text(int idx) const noexcept
+{
+    auto* ptr = static_cast<const char*>(static_cast<const void*>(sqlite3_column_text(stmt_, idx)));
+    return ptr ? ptr : "";
+}
+
+std::int64_t Stmt::column_int64(int idx) const noexcept
+{
+    return sqlite3_column_int64(stmt_, idx);
+}
+
+// ============================================================
 // Database
 // ============================================================
 
 Database::Database()
-    : user_cache_(1000, std::chrono::seconds{300})
-    , message_cache_(100, std::chrono::seconds{60})
+    : Database(4096, 256)
+{
+}
+
+Database::Database(std::size_t user_cache_size, std::size_t message_cache_size)
+    : user_cache_(user_cache_size == 0 ? 1 : user_cache_size, std::chrono::seconds{300})
+    , message_cache_(message_cache_size == 0 ? 1 : message_cache_size, std::chrono::seconds{60})
 {
     if (sodium_init() < 0) {
         spdlog::error("Failed to initialize libsodium");
@@ -100,12 +149,17 @@ bool Database::open(const std::string& db_path)
         return false;
     }
 
-    sqlite3_exec(db, "PRAGMA journal_mode=WAL",   nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA synchronous=NORMAL",  nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA cache_size=-64000",   nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA temp_store=MEMORY",   nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA mmap_size=268435456", nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "PRAGMA page_size=4096",      nullptr, nullptr, nullptr);
+    // Without a busy timeout any concurrent writer immediately fails with
+    // SQLITE_BUSY once more than one thread touches the database.
+    sqlite3_busy_timeout(db, 5000);
+
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL",     nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL",   nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA cache_size=-64000",    nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA temp_store=MEMORY",    nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA mmap_size=268435456",  nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA foreign_keys=ON",      nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA wal_autocheckpoint=1000", nullptr, nullptr, nullptr);
 
     db_ = db;
     return create_tables();
@@ -114,12 +168,40 @@ bool Database::open(const std::string& db_path)
 void Database::close()
 {
     std::lock_guard lock(db_mutex_);
+
+    // Prepared statements must be finalised before the connection is closed,
+    // otherwise sqlite3_close() fails and leaves the handle dangling.
+    for (auto& [sql, stmt] : stmt_cache_) {
+        if (stmt) sqlite3_finalize(stmt);
+    }
+    stmt_cache_.clear();
+
     if (db_) {
         sqlite3_close(db_);
         db_ = nullptr;
     }
     user_cache_.clear();
     message_cache_.clear();
+}
+
+sqlite3_stmt* Database::prepare_cached(const std::string& sql)
+{
+    auto it = stmt_cache_.find(sql);
+    if (it != stmt_cache_.end()) {
+        sqlite3_reset(it->second);
+        sqlite3_clear_bindings(it->second);
+        return it->second;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v3(db_, sql.c_str(), -1, SQLITE_PREPARE_PERSISTENT, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare statement: {} ({})", sql, sqlite3_errmsg(db_));
+        return nullptr;
+    }
+
+    // The cache is bounded by the number of distinct SQL strings in this file.
+    stmt_cache_.emplace(sql, stmt);
+    return stmt;
 }
 
 bool Database::create_tables()
@@ -459,20 +541,24 @@ bool Database::update_user_avatar(std::string_view user_id, std::string_view ava
 
 // --- Message operations ---
 
-bool Database::save_message(std::string_view sender_id, std::string_view sender_nickname,
-                            std::string_view receiver_id, std::string_view text,
-                            std::string_view message_type,
-                            std::string_view file_url, std::string_view file_name,
-                            std::int64_t file_size)
+std::int64_t Database::save_message(std::string_view sender_id, std::string_view sender_nickname,
+                                    std::string_view receiver_id, std::string_view text,
+                                    std::string_view message_type,
+                                    std::string_view file_url, std::string_view file_name,
+                                    std::int64_t file_size)
 {
-    int rc;
     std::string sid(sender_id), snick(sender_nickname), rid(receiver_id);
     std::string txt(text), mtype(message_type), furl(file_url), fname(file_name);
+
+    int rc;
+    std::int64_t new_id = 0;
     {
         std::lock_guard lock(db_mutex_);
 
-        SqliteStmt stmt(db_, "INSERT INTO messages (sender_id, sender_nickname, receiver_id, text, message_type, file_url, file_name, file_size, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", true);
-        if (!stmt) return false;
+        Stmt stmt(prepare_cached(
+            "INSERT INTO messages (sender_id, sender_nickname, receiver_id, text, message_type, "
+            "file_url, file_name, file_size, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        if (!stmt) return 0;
 
         stmt.bind_text(1, sid);
         stmt.bind_text(2, snick);
@@ -485,6 +571,7 @@ bool Database::save_message(std::string_view sender_id, std::string_view sender_
         stmt.bind_int64(9, current_timestamp());
 
         rc = stmt.step();
+        if (rc == SQLITE_DONE) new_id = sqlite3_last_insert_rowid(db_);
     }
 
     if (rc == SQLITE_DONE) {
@@ -493,9 +580,8 @@ bool Database::save_message(std::string_view sender_id, std::string_view sender_
             message_cache_.remove("private:" + std::min(sid, rid) + ":" + std::max(sid, rid));
             message_cache_.remove("group:" + rid);
         }
-        return true;
     }
-    return false;
+    return new_id;
 }
 
 MessageRecord Database::read_message_row(const SqliteStmt& stmt) const noexcept
@@ -622,8 +708,12 @@ bool Database::recall_message(std::int64_t message_id, std::string_view user_id)
     stmt.bind_text(3, uid);
 
     if (stmt.step() == SQLITE_DONE) {
-        message_cache_.remove("recent");
-        return true;
+        // SQLITE_DONE only means the statement ran. Without checking the
+        // affected-row count a recall by a non-owner looked successful while
+        // changing nothing.
+        const bool changed = sqlite3_changes(db_) > 0;
+        if (changed) message_cache_.remove("recent");
+        return changed;
     }
     return false;
 }
@@ -643,8 +733,9 @@ bool Database::edit_message(std::int64_t message_id, std::string_view user_id, s
     stmt.bind_text(3, uid);
 
     if (stmt.step() == SQLITE_DONE) {
-        message_cache_.remove("recent");
-        return true;
+        const bool changed = sqlite3_changes(db_) > 0;
+        if (changed) message_cache_.remove("recent");
+        return changed;
     }
     return false;
 }
@@ -661,8 +752,9 @@ bool Database::delete_message(std::int64_t message_id, std::string_view user_id)
     stmt.bind_text(2, uid);
 
     if (stmt.step() == SQLITE_DONE) {
-        message_cache_.remove("recent");
-        return true;
+        const bool changed = sqlite3_changes(db_) > 0;
+        if (changed) message_cache_.remove("recent");
+        return changed;
     }
     return false;
 }
@@ -911,6 +1003,91 @@ bool Database::remove_group_member(std::string_view group_id, std::string_view u
     return stmt.step() == SQLITE_DONE;
 }
 
+std::vector<std::tuple<std::string, std::string>> Database::get_group_members(std::string_view group_id)
+{
+    std::lock_guard lock(db_mutex_);
+
+    SqliteStmt stmt(db_,
+        "SELECT user_id, role FROM group_members WHERE group_id = ?", true);
+    if (!stmt) return {};
+
+    std::string gid(group_id);
+    stmt.bind_text(1, gid);
+
+    std::vector<std::tuple<std::string, std::string>> members;
+    while (stmt.step() == SQLITE_ROW) {
+        members.emplace_back(stmt.column_text(0), stmt.column_text(1));
+    }
+    return members;
+}
+
+std::vector<std::tuple<std::string, std::string, std::string>> Database::get_all_groups()
+{
+    std::lock_guard lock(db_mutex_);
+
+    SqliteStmt stmt(db_,
+        "SELECT group_id, group_name, owner_id FROM groups_data ORDER BY created_at", true);
+    if (!stmt) return {};
+
+    std::vector<std::tuple<std::string, std::string, std::string>> groups;
+    while (stmt.step() == SQLITE_ROW) {
+        groups.emplace_back(stmt.column_text(0), stmt.column_text(1), stmt.column_text(2));
+    }
+    return groups;
+}
+
+std::vector<Database::GroupSummary> Database::list_groups()
+{
+    std::lock_guard lock(db_mutex_);
+
+    // One pass: member count and the last message are aggregated in SQL so the
+    // client sidebar does not trigger a query per group.
+    SqliteStmt stmt(db_, R"(
+        SELECT g.group_id,
+               g.group_name,
+               g.owner_id,
+               g.created_at,
+               (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.group_id),
+               COALESCE((SELECT m2.text FROM messages m2
+                          WHERE m2.receiver_id = g.group_id AND m2.message_type = 'group'
+                          ORDER BY m2.id DESC LIMIT 1), ''),
+               COALESCE((SELECT m3.timestamp FROM messages m3
+                          WHERE m3.receiver_id = g.group_id AND m3.message_type = 'group'
+                          ORDER BY m3.id DESC LIMIT 1), 0)
+        FROM groups_data g
+        ORDER BY g.created_at DESC
+    )", true);
+    if (!stmt) return {};
+
+    std::vector<GroupSummary> groups;
+    while (stmt.step() == SQLITE_ROW) {
+        GroupSummary summary;
+        summary.group_id     = stmt.column_text(0);
+        summary.name         = stmt.column_text(1);
+        summary.owner_id     = stmt.column_text(2);
+        summary.created_at   = stmt.column_int64(3);
+        summary.member_count = static_cast<int>(stmt.column_int64(4));
+        summary.last_text    = stmt.column_text(5);
+        summary.last_ts      = stmt.column_int64(6);
+        groups.push_back(std::move(summary));
+    }
+    return groups;
+}
+
+std::optional<std::tuple<std::string, std::string, std::string>>
+Database::get_group_info(std::string_view group_id)
+{
+    std::lock_guard lock(db_mutex_);
+
+    SqliteStmt stmt(db_, "SELECT group_id, group_name, owner_id FROM groups_data WHERE group_id = ?", true);
+    if (!stmt) return std::nullopt;
+
+    std::string gid(group_id);
+    stmt.bind_text(1, gid);
+    if (stmt.step() != SQLITE_ROW) return std::nullopt;
+    return std::make_tuple(stmt.column_text(0), stmt.column_text(1), stmt.column_text(2));
+}
+
 // ── Restored implementations ──────────────────────────────
 
 bool Database::set_session_token(std::string_view user_id, std::string_view token,
@@ -1009,36 +1186,79 @@ std::vector<std::string> Database::get_message_readers(std::int64_t message_id) 
     return readers;
 }
 
-// ── FTS5 Full-text Search (v2.3) ──────────────────────────
+// ── Full-text search (FTS5 + LIKE fallback) ───────────────
 
 std::vector<Database::SearchResult> Database::search_messages(std::string_view query, int limit, int offset) {
     std::lock_guard lock(db_mutex_);
-    // Simple query: FTS5 MATCH with rank sorting
-    SqliteStmt stmt(db_,
-        "SELECT m.id, m.sender_id, m.sender_nickname, m.text, m.receiver_id, "
-        "m.message_type, m.timestamp, rank FROM messages_fts f "
-        "JOIN messages m ON f.rowid = m.id "
-        "WHERE messages_fts MATCH ? ORDER BY rank LIMIT ? OFFSET ?", true);
-    if (!stmt) return {};
 
-    std::string q(query);
-    stmt.bind_text(1, q);
-    stmt.bind_int(2, limit);
-    stmt.bind_int(3, offset);
+    const std::string q(query);
+    if (q.empty()) return {};
 
     std::vector<SearchResult> results;
-    while (stmt.step() == SQLITE_ROW) {
-        SearchResult r;
-        r.message_id = stmt.column_int64(0);
-        r.sender_id = stmt.column_text(1);
-        r.sender_nickname = stmt.column_text(2);
-        r.text = stmt.column_text(3);
-        r.receiver_id = stmt.column_text(4);
-        r.message_type = stmt.column_text(5);
-        r.timestamp = stmt.column_int64(6);
-        r.rank = static_cast<double>(stmt.column_int64(7));
-        results.push_back(std::move(r));
+
+    auto read_rows = [&results](SqliteStmt& stmt) {
+        while (stmt.step() == SQLITE_ROW) {
+            SearchResult r;
+            r.message_id      = stmt.column_int64(0);
+            r.sender_id       = stmt.column_text(1);
+            r.sender_nickname = stmt.column_text(2);
+            r.text            = stmt.column_text(3);
+            r.receiver_id     = stmt.column_text(4);
+            r.message_type    = stmt.column_text(5);
+            r.timestamp       = stmt.column_int64(6);
+            r.rank            = static_cast<double>(stmt.column_int64(7));
+            results.push_back(std::move(r));
+        }
+    };
+
+    // 1) FTS5 phrase query. Quoting the whole query keeps user input from being
+    //    parsed as FTS syntax (a stray quote used to make MATCH fail silently).
+    {
+        std::string phrase = "\"";
+        for (char c : q) {
+            if (c == '"') phrase.push_back('"');
+            phrase.push_back(c);
+        }
+        phrase.push_back('"');
+
+        SqliteStmt stmt(db_,
+            "SELECT m.id, m.sender_id, m.sender_nickname, m.text, m.receiver_id, "
+            "m.message_type, m.timestamp, rank FROM messages_fts f "
+            "JOIN messages m ON f.rowid = m.id "
+            "WHERE messages_fts MATCH ? AND m.is_recalled = 0 "
+            "ORDER BY rank LIMIT ? OFFSET ?", true);
+        if (stmt) {
+            stmt.bind_text(1, phrase);
+            stmt.bind_int(2, limit);
+            stmt.bind_int(3, offset);
+            read_rows(stmt);
+        }
     }
+
+    // 2) The default unicode61 tokenizer does not segment CJK, so a substring
+    //    like "编辑" never matches "已编辑的内容". Fall back to LIKE, which is
+    //    correct for every language and fast enough for chat-sized tables.
+    if (results.empty()) {
+        std::string pattern = "%";
+        for (char c : q) {
+            if (c == '%' || c == '_' || c == '\\') pattern.push_back('\\');
+            pattern.push_back(c);
+        }
+        pattern.push_back('%');
+
+        SqliteStmt stmt(db_,
+            "SELECT id, sender_id, sender_nickname, text, receiver_id, message_type, "
+            "timestamp, 0 FROM messages "
+            "WHERE text LIKE ? ESCAPE '\\' AND is_recalled = 0 "
+            "ORDER BY timestamp DESC LIMIT ? OFFSET ?", true);
+        if (stmt) {
+            stmt.bind_text(1, pattern);
+            stmt.bind_int(2, limit);
+            stmt.bind_int(3, offset);
+            read_rows(stmt);
+        }
+    }
+
     return results;
 }
 

@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markdown 渲染性能基准 · IM 聊天室</title>
+<style>
+  :root {
+    --bg: #eef0f4;
+    --panel: #fff;
+    --ink: #14171c;
+    --muted: #7b8494;
+    --line: #e4e7ec;
+    --accent: #3b5bfd;
+    --accent-2: #7a5cfb;
+    --ok: #18a058;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 28px 20px 60px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.6 "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+
+  .wrap { max-width: 1020px; margin: 0 auto; }
+
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 22px; font-size: 13px; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .05);
+  }
+
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+
+  label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+
+  input[type="number"] {
+    width: 124px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    font: inherit;
+    font-size: 13px;
+    background: #f7f8fa;
+    color: var(--ink);
+  }
+
+  button {
+    border: 0;
+    border-radius: 10px;
+    padding: 9px 18px;
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 600;
+    cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff;
+    box-shadow: 0 10px 20px -14px var(--accent);
+  }
+
+  button.ghost {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    box-shadow: none;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.desc { color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+
+  .tag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 99px;
+    font-size: 11px;
+    background: #eef1ff;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+
+  .tag.good { background: #e9f7ef; color: var(--ok); }
+
+  .log {
+    margin-top: 12px;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    min-height: 20px;
+  }
+
+  #sandbox {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    width: 600px;
+    visibility: hidden;
+  }
+
+  .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Markdown 渲染性能基准</h1>
+  <p class="sub">
+    同一份数据，对比「每次重解析 + 全量重绘」和「解析缓存 + 增量追加」。
+    数字在本机浏览器里现算，绝对值随机器变化，看相对关系即可。
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <label>消息总数
+        <input type="number" id="count" value="1000" min="100" max="5000" step="100">
+      </label>
+      <label>Markdown 占比 %
+        <input type="number" id="ratio" value="50" min="0" max="100" step="10">
+      </label>
+      <button id="run">运行基准</button>
+      <button class="ghost" id="clear">清空缓存</button>
+    </div>
+    <p class="note">
+      数据混合了纯文本、行内 Markdown（粗体 / 行内代码 / 链接）、代码块与列表。
+    </p>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:46%">场景</th>
+          <th class="num">耗时</th>
+          <th class="num">每条</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody id="result">
+        <tr><td colspan="4" style="color:var(--muted)">点击「运行基准」开始</td></tr>
+      </tbody>
+    </table>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<div id="sandbox"></div>
+
+<script src="/markdown.js"></script>
+<script>
+(() => {
+  'use strict';
+
+  const $ = (s) => document.querySelector(s);
+  const sandbox = $('#sandbox');
+
+  // ── 造数据 ────────────────────────────────────────────
+
+  const PLAIN = [
+    '在的，稍等我看一下代码',
+    '这个接口今天下午就能联调完',
+    '刚才那个崩溃复现了，是空指针',
+    '好的，收到 👌',
+    '晚点一起过一遍评审吧',
+  ];
+
+  const INLINE_MD = [
+    '把 `save_message()` 的返回值改成 **消息ID**，前端就能直接编辑了',
+    '这里要注意：*先转义再解析*，不然 `</div>` 会把结构冲掉',
+    '文档见 https://example.com/docs ，第 3 节有说明',
+    '~~旧的限流实现~~ 已经换成令牌桶了，见 `rate_limiter.hpp`',
+  ];
+
+  const BLOCK_MD = [
+    '## 今天的改动\n- 线程池隔离阻塞操作\n- 群消息定向投递\n- 权限判断改成 `sqlite3_changes()`',
+    '```cpp\nint main() {\n  std::cout << "hello";\n  return 0;\n}\n```',
+    '> 先转义，再解析 —— 不然就是 XSS。\n\n补充：代码块内不做任何解析。',
+    '1. 拉取最新代码\n2. 重新编译\n3. 跑一遍 `tools/e2e.js`\n\n- [x] 后端\n- [ ] 安卓端',
+  ];
+
+  const BLOCK_HINT = /\n/;
+
+  function makeMessages(count, ratio) {
+    const mdCount = Math.round(count * ratio / 100);
+    const messages = [];
+    for (let i = 0; i < count; i++) {
+      const isMd = i < mdCount;
+      let text;
+      if (!isMd) text = PLAIN[i % PLAIN.length];
+      else if (i % 5 === 0) text = BLOCK_MD[i % BLOCK_MD.length];
+      else text = INLINE_MD[i % INLINE_MD.length];
+
+      messages.push({
+        id: i + 1,
+        userId: i % 3 === 0 ? 'u_me' : `u_${i % 7}`,
+        text,
+        blocky: BLOCK_HINT.test(text),
+        ts: 1730000000 + i * 30,
+      });
+    }
+    return messages;
+  }
+
+  const esc = (v) => String(v ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+  function htmlFor(m, withMarkdown) {
+    const body = withMarkdown
+      ? (m.blocky ? IMD.render(m.text) : IMD.renderInline(m.text))
+      : esc(m.text);
+    const cls = withMarkdown ? `bubble md${m.blocky ? ' md-block' : ''}` : 'bubble';
+    return `<div class="msg" data-id="${m.id}"><div class="avatar sm"></div>` +
+      `<div class="msg-body"><div class="${cls}">${body}<span class="meta">12:00</span></div></div></div>`;
+  }
+
+  function parseAll(messages) {
+    for (const m of messages) {
+      if (m.blocky) IMD.render(m.text);
+      else IMD.renderInline(m.text);
+    }
+  }
+
+  // 长文本样本：模拟贴一段 3KB 的代码
+  function makeBigSample(n) {
+    const lines = [];
+    for (let i = 0; i < 70; i++) {
+      lines.push(`  int value_${i} = compute(${i}, "第 ${i} 行"); // 注释`);
+    }
+    const body = lines.join('\n');
+    return Array.from({ length: n }, (_, i) => '```cpp\n' + body.replace(/_/g, '_' + i + '_') + '\n```');
+  }
+
+  function timeIt(fn) {
+    const start = performance.now();
+    fn();
+    return performance.now() - start;
+  }
+
+  const per = (ms, n) => {
+    const value = ms * 1000 / n;
+    return value < 0.05 ? '< 0.1 µs' : `${value.toFixed(1)} µs`;
+  };
+
+  const fmtMs = (ms) => (ms < 0.01 ? '< 0.01 ms' : `${ms.toFixed(2)} ms`);
+
+  // ── 基准 ──────────────────────────────────────────────
+
+  function run() {
+    const count = Math.max(100, Math.min(5000, Number($('#count').value) || 1000));
+    const ratio = Math.max(0, Math.min(100, Number($('#ratio').value) || 0));
+    const messages = makeMessages(count, ratio);
+
+    sandbox.innerHTML = '';
+
+    // JIT 预热：避免把首次编译的时间算进"冷缓存"，否则对比不公平
+    for (let i = 0; i < 60; i++) {
+      IMD.renderInline('预热 **粗体** 和 `code` 以及 https://example.com/' + i);
+      if (i % 10 === 0) IMD.render('```js\nconst a = ' + i + ';\n```\n- 列表 **项**');
+    }
+
+    // 1. 解析（冷缓存）
+    IMD.clearCache();
+    const coldParse = timeIt(() => parseAll(messages));
+
+    // 2. 解析（命中缓存）
+    const warmParse = timeIt(() => parseAll(messages));
+
+    // 2b. 长文本（代码块）冷 / 热
+    const bigs = makeBigSample(50);
+    IMD.clearCache();
+    const bigCold = timeIt(() => bigs.forEach((t) => IMD.render(t)));
+    const bigWarm = timeIt(() => bigs.forEach((t) => IMD.render(t)));
+
+    // 3. 全量渲染（缓存已热）
+    const fullRender = timeIt(() => {
+      sandbox.innerHTML = messages.map((m) => htmlFor(m, true)).join('');
+    });
+
+    // 4. 来一条新消息：旧做法 = 整表重建
+    const extra = { ...messages[0], id: 999999, text: INLINE_MD[0], blocky: false };
+    const all = messages.concat([extra]);
+    const rebuild = timeIt(() => {
+      sandbox.innerHTML = all.map((m) => htmlFor(m, true)).join('');
+    });
+
+    // 5. 来一条新消息：新做法 = 只追加一个节点（连追加 100 条取平均）
+    const appendCount = Math.min(100, count);
+    const appendOne = timeIt(() => {
+      let html = '';
+      for (let i = 0; i < appendCount; i++) {
+        html += htmlFor({ ...extra, id: 999000 + i }, true);
+      }
+      sandbox.insertAdjacentHTML('beforeend', html);
+    }) / appendCount;
+
+    // 缓存命中后总耗时可能低于计时器精度，比值要保守表述
+    const ratioNote = (cold, warm) => (warm >= 0.05
+      ? `${(cold / warm).toFixed(0)}× 更快`
+      : `> ${(cold / 0.05).toFixed(0)}× 更快（低于计时精度）`);
+
+    const rows = [
+      ['解析全部消息（冷缓存）', coldParse, per(coldParse, count), '首次遇到这些文本', ''],
+      ['解析全部消息（命中缓存）', warmParse, per(warmParse, count), ratioNote(coldParse, warmParse), 'good'],
+      ['解析 50 条 3KB 代码块（冷缓存）', bigCold, per(bigCold, 50), '每次都要重新扫全文', ''],
+      ['解析 50 条 3KB 代码块（命中缓存）', bigWarm, per(bigWarm, 50), ratioNote(bigCold, bigWarm), 'good'],
+      [`打开会话：全量渲染 ${count} 条`, fullRender, per(fullRender, count), '只发生一次', ''],
+      ['来 1 条新消息 · 旧做法（整表重绘）', rebuild, '—',
+        `要重建 ${count + 1} 个节点`, ''],
+      ['来 1 条新消息 · 新做法（增量追加）', appendOne, '—',
+        `${(rebuild / Math.max(appendOne, 0.001)).toFixed(0)}× 更快`, 'good'],
+    ];
+
+    $('#result').innerHTML = rows.map(([name, ms, each, note, kind]) => `
+      <tr>
+        <td>${name}</td>
+        <td class="num">${fmtMs(ms)}</td>
+        <td class="num">${each}</td>
+        <td class="desc">${kind ? `<span class="tag ${kind}">${note}</span>` : note}</td>
+      </tr>`).join('');
+
+    const burst = 20;
+    $('#log').textContent =
+      `样本 ${count} 条（其中 Markdown ${Math.round(count * ratio / 100)} 条）· ` +
+      `单条平均 ${per(fullRender, count)} · 增量追加 ${(appendOne * 1000).toFixed(0)} µs/条\n` +
+      `突发 ${burst} 条消息时主线程占用：旧做法 ${(rebuild * burst).toFixed(0)} ms → ` +
+      `新做法 ${(appendOne * burst).toFixed(2)} ms`;
+
+    sandbox.innerHTML = '';
+  }
+
+  $('#run').onclick = run;
+  $('#clear').onclick = () => {
+    IMD.clearCache();
+    $('#log').textContent = '缓存已清空，下次渲染会重新解析';
+  };
+
+  run();
+})();
+</script>
+</body>
+</html>

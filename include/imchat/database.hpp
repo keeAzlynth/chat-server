@@ -1,6 +1,7 @@
 #pragma once
 
 #include "imchat/lru_cache.hpp"
+#include "imchat/string_hash.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -10,6 +11,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 struct sqlite3;
@@ -115,9 +118,40 @@ private:
     sqlite3_stmt* stmt_{nullptr};
 };
 
+// Non-owning view over a cached statement.
+//
+// Preparing a statement on every message costs a parse of the SQL text on the
+// hot path. `prepare_cached()` keeps one prepared statement per SQL string and
+// this wrapper resets it (and clears bindings) on scope exit, so the next
+// caller starts from a clean state.
+class Stmt final {
+public:
+    explicit Stmt(sqlite3_stmt* stmt) noexcept : stmt_(stmt) {}
+    ~Stmt();
+
+    Stmt(const Stmt&) = delete;
+    Stmt& operator=(const Stmt&) = delete;
+
+    explicit operator bool() const noexcept { return stmt_ != nullptr; }
+    [[nodiscard]] sqlite3_stmt* get() const noexcept { return stmt_; }
+
+    bool bind_text(int idx, const std::string& value) noexcept;
+    bool bind_int64(int idx, std::int64_t value) noexcept;
+    bool bind_int(int idx, int value) noexcept;
+
+    int step() noexcept;
+
+    [[nodiscard]] std::string column_text(int idx) const noexcept;
+    [[nodiscard]] std::int64_t column_int64(int idx) const noexcept;
+
+private:
+    sqlite3_stmt* stmt_{nullptr};
+};
+
 class Database final {
 public:
     Database();
+    Database(std::size_t user_cache_size, std::size_t message_cache_size);
     ~Database();
 
     Database(const Database&) = delete;
@@ -173,7 +207,9 @@ public:
                                                   std::string_view chat_id, std::string_view text, std::int64_t send_at);
     [[nodiscard]] std::vector<MessageRecord> get_due_scheduled_messages(std::int64_t before_ts);
     [[nodiscard]] bool mark_scheduled_sent(std::int64_t schedule_id);
-    [[nodiscard]] bool save_message(std::string_view sender_id, std::string_view sender_nickname,
+    // Returns the new message id, or 0 when the insert failed. Callers need the
+    // id to tag the broadcast payload so clients can edit/recall immediately.
+    [[nodiscard]] std::int64_t save_message(std::string_view sender_id, std::string_view sender_nickname,
                       std::string_view receiver_id, std::string_view text,
                       std::string_view message_type = "text",
                       std::string_view file_url = "", std::string_view file_name = "",
@@ -224,6 +260,19 @@ public:
     [[nodiscard]] std::optional<std::tuple<std::string, std::string, std::string>> get_group_info(std::string_view group_id);
     [[nodiscard]] std::vector<std::tuple<std::string, std::string, std::string>> get_all_groups();
 
+    // Group list for the client sidebar: one query with aggregated member count
+    // and last message instead of an N+1 walk over every group.
+    struct GroupSummary {
+        std::string  group_id;
+        std::string  name;
+        std::string  owner_id;
+        std::int64_t created_at{0};
+        int          member_count{0};
+        std::string  last_text;
+        std::int64_t last_ts{0};
+    };
+    [[nodiscard]] std::vector<GroupSummary> list_groups();
+
     // Read receipts
     [[nodiscard]] bool mark_chat_read(std::string_view chat_id, std::string_view user_id, std::int64_t last_read_id);
     [[nodiscard]] std::int64_t get_read_cursor(std::string_view chat_id, std::string_view user_id);
@@ -247,12 +296,16 @@ private:
     [[nodiscard]] std::optional<UserRecord> fetch_user_by_column(const char* column, const std::string& value);
     [[nodiscard]] MessageRecord read_message_row(const SqliteStmt& stmt) const noexcept;
 
+    // Returns a cached, already-prepared statement. Caller must hold db_mutex_.
+    [[nodiscard]] sqlite3_stmt* prepare_cached(const std::string& sql);
+
     sqlite3* db_{nullptr};
 
     LRUCache<std::string, UserRecord>          user_cache_;
     LRUCache<std::string, std::vector<MessageRecord>> message_cache_;
 
     mutable std::mutex db_mutex_;
+    StringMap<sqlite3_stmt*> stmt_cache_;
 };
 
 } // namespace imchat

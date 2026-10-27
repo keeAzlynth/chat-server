@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IM 聊天室</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="/config.js"></script>
+</head>
+<body>
+
+<div class="app" id="app" hidden>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-logo">IM</div>
+      <div class="brand-text">
+        <strong>聊天室</strong>
+        <span>实时 · 多端</span>
+      </div>
+      <button class="icon-btn" id="theme-toggle" title="切换主题">◐</button>
+    </div>
+
+    <div class="me-card">
+      <div class="avatar" id="me-avatar">?</div>
+      <div class="me-meta">
+        <div class="me-name" id="me-name">—</div>
+        <div class="me-status" id="me-status">未登录</div>
+      </div>
+      <button class="icon-btn" id="logout-btn" title="退出登录">⎋</button>
+    </div>
+
+    <div class="search">
+      <input id="search-input" placeholder="搜索聊天记录…" autocomplete="off" maxlength="64">
+      <div class="search-results" id="search-results" hidden></div>
+    </div>
+
+    <nav class="convos" id="convos">
+      <div class="convo-group">
+        <div class="convo-group-title"><span>频道</span></div>
+        <button class="convo active" data-key="public" type="button">
+          <span class="convo-icon">#</span>
+          <span class="convo-title">公共大厅</span>
+          <span class="badge" data-unread="public" hidden>0</span>
+        </button>
+      </div>
+
+      <div class="convo-group">
+        <div class="convo-group-title">
+          <span>私聊</span>
+          <button class="mini" id="new-dm" type="button" title="发起私聊">＋</button>
+        </div>
+        <div id="dm-list"></div>
+      </div>
+
+      <div class="convo-group">
+        <div class="convo-group-title">
+          <span>群组</span>
+          <button class="mini" id="new-group" type="button" title="创建群组">＋</button>
+        </div>
+        <div id="group-list"></div>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <span class="dot" id="conn-dot"></span>
+      <span id="conn-text">连接中…</span>
+      <span class="spacer"></span>
+      <span id="online-count">0 在线</span>
+    </div>
+  </aside>
+
+  <main class="chat">
+    <header class="chat-head">
+      <button class="icon-btn only-mobile" id="menu-btn" title="菜单">☰</button>
+      <div class="chat-head-text">
+        <h1 id="chat-title">公共大厅</h1>
+        <p id="chat-sub">所有在线用户可见</p>
+      </div>
+      <div class="chat-actions">
+        <button class="icon-btn" id="pinned-btn" title="置顶消息">📌</button>
+        <button class="icon-btn" id="members-btn" title="成员列表">👥</button>
+      </div>
+    </header>
+
+    <div class="messages" id="messages" role="log" aria-live="polite"></div>
+    <div class="typing" id="typing"></div>
+
+    <div class="preview" id="preview" hidden></div>
+
+    <form class="composer" id="composer">
+      <button type="button" class="icon-btn" id="attach-btn" title="发送文件">📎</button>
+      <button type="button" class="icon-btn" id="preview-btn" title="预览 Markdown">👁</button>
+      <input type="file" id="file-input" hidden>
+      <textarea id="message-input" rows="1"
+                placeholder="输入消息，Enter 发送，Shift + Enter 换行（支持 Markdown）"></textarea>
+      <span class="counter" id="counter"></span>
+      <button type="submit" class="send-btn" id="send-btn">发送</button>
+    </form>
+  </main>
+
+  <aside class="rail" id="rail">
+    <section>
+      <h2>在线成员</h2>
+      <div id="member-list" class="member-list"></div>
+    </section>
+    <section>
+      <h2>置顶消息</h2>
+      <div id="pinned-list" class="pinned-list"><p class="muted">暂无置顶</p></div>
+    </section>
+  </aside>
+</div>
+
+<div class="auth" id="auth">
+  <div class="auth-card">
+    <div class="auth-brand"><span class="brand-logo">IM</span><div><strong>聊天室</strong><small>登录后开始聊天</small></div></div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login" type="button">登录</button>
+      <button class="tab" data-tab="register" type="button">注册</button>
+    </div>
+
+    <form id="auth-form">
+      <label>用户名
+        <input id="auth-username" autocomplete="username" maxlength="64" required>
+      </label>
+      <label class="only-register">昵称
+        <input id="auth-nickname" autocomplete="nickname" maxlength="32" placeholder="别人看到的名字">
+      </label>
+      <label>密码
+        <input id="auth-password" type="password" autocomplete="current-password" maxlength="128" required>
+      </label>
+      <button class="primary" type="submit" id="auth-submit">登录</button>
+      <p class="auth-error" id="auth-error"></p>
+    </form>
+
+    <p class="auth-hint">不想注册？<button class="link" id="guest-btn" type="button">以游客身份进入</button></p>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<div class="ctx" id="ctx-menu" hidden></div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-card">
+    <h3 id="modal-title">标题</h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="ghost" id="modal-cancel" type="button">取消</button>
+      <button class="primary" id="modal-ok" type="button">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/markdown.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

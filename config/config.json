@@ -1,0 +1,29 @@
+{
+    "host": "0.0.0.0",
+    "port": 8080,
+    "http_port": 8081,
+    "enable_http": true,
+    "web_root": "web",
+    "upload_dir": "uploads",
+    "enable_cors": true,
+
+    "max_connections": 5000,
+    "message_max_length": 2000,
+    "max_ws_message_bytes": 65536,
+    "max_upload_bytes": 8388608,
+    "max_history_limit": 200,
+
+    "rate_limit_msgs_per_sec": 10,
+    "rate_limit_burst": 20,
+    "auth_attempts_per_sec": 1,
+    "auth_burst": 5,
+
+    "log_level": "info",
+    "log_file": "logs/im-chat.log",
+    "db_path": "imchat.db",
+    "user_cache_size": 4096,
+    "message_cache_size": 256,
+
+    "io_threads": 0,
+    "worker_threads": 0
+}
